@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>实时语音转文字</title>
+    <!-- 引入Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background-color: #f8f9fa;
+            padding: 20px;
+        }
+        .container {
+            max-width: 800px;
+            margin-top: 50px;
+        }
+        .btn-action {
+            margin: 10px;
+            padding: 10px 25px;
+            font-weight: bold;
+        }
+        #transcript {
+            background-color: white;
+            border-radius: 8px;
+            padding: 20px;
+            min-height: 200px;
+            margin-top: 20px;
+            border: 1px solid #dee2e6;
+            white-space: pre-wrap;
+        }
+        .status-indicator {
+            width: 15px;
+            height: 15px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 10px;
+        }
+        .status-off {
+            background-color: #dc3545;
+        }
+        .status-on {
+            background-color: #28a745;
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.2); }
+            100% { transform: scale(1); }
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1 class="display-4">实时语音转文字</h1>
+            <p class="lead">点击"开始转录"按钮，开始将您的语音实时转换为文字</p>
+            <p class="lead">此版本为公司本地部署的Whisper-large-v3模型demo</p>
+        </div>
+
+        <div class="text-center">
+            <button id="start" class="btn btn-success btn-action">
+                <i class="bi bi-mic-fill"></i> 开始转录
+            </button>
+            <button id="stop" class="btn btn-danger btn-action" disabled>
+                <i class="bi bi-mic-mute-fill"></i> 停止转录
+            </button>
+        </div>
+
+        <div class="mt-4">
+            <div class="d-flex align-items-center mb-2">
+                <span id="status-indicator" class="status-indicator status-off"></span>
+                <span id="status-text">状态: 未连接</span>
+            </div>
+            <h4>转录结果:</h4>
+            <div id="transcript" class="shadow-sm"></div>
+            <div id="log" class="shadow-sm" style="white-space: pre-wrap;"></div>
+        </div>
+    </div>
+
+    <!-- 引入Bootstrap Icons -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+    <!-- 引入Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+
+    <script>
+        let audioContext;
+        let source;
+        let scriptNode;
+        let websocket;
+        let recording = false;
+        let accumulatedSamples = new Float32Array();
+        const chunkDuration = 5; // 每个音频块的持续时间(秒)
+        let sampleRate;
+
+        // 获取DOM元素
+        const startBtn = document.getElementById('start');
+        const stopBtn = document.getElementById('stop');
+        const transcriptDiv = document.getElementById('transcript');
+        const log = document.getElementById('log');
+        const statusIndicator = document.getElementById('status-indicator');
+        const statusText = document.getElementById('status-text');
+
+        // 添加事件监听器
+        startBtn.addEventListener('click', startTranscription);
+        stopBtn.addEventListener('click', stopTranscription);
+
+        function updateStatus(connected) {
+            if (connected) {
+                statusIndicator.className = 'status-indicator status-on';
+                statusText.textContent = '状态: 正在转录中...';
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+            } else {
+                statusIndicator.className = 'status-indicator status-off';
+                statusText.textContent = '状态: 未连接';
+                startBtn.disabled = false;
+                stopBtn.disabled = true;
+            }
+        }
+
+        function startTranscription() {
+            if (recording) return;
+            recording = true;
+            updateStatus(true);
+
+            // 请求麦克风权限并设置音频处理
+            navigator.mediaDevices.getUserMedia({ audio: true })
+                .then(stream => {
+                    // 创建音频上下文
+                    audioContext = new AudioContext();
+                    source = audioContext.createMediaStreamSource(stream);
+                    scriptNode = audioContext.createScriptProcessor(4096, 1, 1);
+                    source.connect(scriptNode);
+                    scriptNode.connect(audioContext.destination);
+                    sampleRate = audioContext.sampleRate;
+                    const samplesPerChunk = sampleRate * chunkDuration;
+
+                    // 音频处理回调函数
+                    scriptNode.onaudioprocess = (e) => {
+                        const inputBuffer = e.inputBuffer.getChannelData(0);
+                        const newSamples = new Float32Array(inputBuffer);
+                        // 累积音频样本
+                        accumulatedSamples = Float32Array.from([...accumulatedSamples,...newSamples]);
+
+                        // 当累积足够样本时发送一个块
+                        while (accumulatedSamples.length >= samplesPerChunk) {
+                            const chunkToSend = accumulatedSamples.subarray(0,samplesPerChunk);
+                            sendChunk(chunkToSend);
+                            accumulatedSamples = accumulatedSamples.subarray(samplesPerChunk);
+                        }
+                    };
+
+                    // 连接到后端的WebSocket端点
+                    websocket = new WebSocket('ws://localhost:8000/transcribe');
+
+                    websocket.onopen = () => {
+                        console.log('WebSocket连接已建立');
+                        log.innerHTML += "\n[系统] 连接已建立，开始转录...\n";
+                    };
+
+                    websocket.onmessage = (event) => {
+                        transcriptDiv.innerHTML += event.data + ' ';
+                        // 自动滚动到底部
+                        transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
+                    };
+
+                    websocket.onerror = (error) => {
+                        console.error('WebSocket错误:', error);
+                        log.innerHTML += "\n[系统] 连接错误: " + error.message + "\n";
+                    };
+
+                    websocket.onclose = () => {
+                        console.log('WebSocket连接已关闭');
+                        log.innerHTML += "\n[系统] 连接已关闭\n";
+                        updateStatus(false);
+                    };
+                })
+                .catch(err => {
+                    console.error('获取麦克风权限失败:', err);
+                    log.innerHTML += "\n[系统] 错误: " + err.message + "\n";
+                    updateStatus(false);
+                    recording = false;
+                });
+        }
+
+        function stopTranscription() {
+            recording = false;
+            updateStatus(false);
+
+            // 关闭音频上下文
+            if (audioContext) {
+                audioContext.close().then(() => {
+                    console.log('音频上下文已关闭');
+                });
+            }
+
+            // 关闭WebSocket连接
+            if (websocket) {
+                websocket.close();
+            }
+
+            // 清空累积的音频样本
+            accumulatedSamples = new Float32Array();
+        }
+
+        // 发送音频块到服务器
+        function sendChunk(floatArray) {
+            const wavBlob = encodeWAV(floatArray);
+            if (websocket && websocket.readyState === WebSocket.OPEN) {
+                websocket.send(wavBlob);
+            }
+        }
+
+        // 将Float32音频数据编码为WAV格式
+        function encodeWAV(samples) {
+            const channels = 1; // 单声道
+            const bitsPerSample = 16; // 16位采样
+            const bytesPerSample = bitsPerSample / 8;
+            const dataLength = samples.length * channels * bytesPerSample;
+            const buffer = new ArrayBuffer(44 + dataLength);
+            const view = new DataView(buffer);
+
+            // 写入WAV头
+            writeString(view, 0, 'RIFF');
+            view.setUint32(4, 36 + dataLength, true); // 文件大小 - 8
+            writeString(view, 8, 'WAVE');
+            writeString(view, 12, 'fmt ');
+            view.setUint32(16, 16, true); // fmt块长度
+            view.setUint16(20, 1, true); // PCM格式
+            view.setUint16(22, channels, true); // 声道数
+            view.setUint32(24, sampleRate, true); // 采样率
+            view.setUint32(28, sampleRate * channels * bytesPerSample, true); // 字节率
+            view.setUint16(32, channels * bytesPerSample, true); // 块对齐
+            view.setUint16(34, bitsPerSample, true); // 每样本位数
+            writeString(view, 36, 'data');
+            view.setUint32(40, dataLength, true); // 数据块长度
+
+            // 写入PCM数据
+            floatTo16BitPCM(view, 44, samples);
+
+            return new Blob([buffer], {type: 'audio/wav'});
+        }
+
+        // 将浮点样本转换为16位PCM
+        function floatTo16BitPCM(output, offset, input) {
+            for (let i = 0; i < input.length; i++, offset += 2) {
+                const s = Math.max(-1, Math.min(1, input[i]));
+                output.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+            }
+        }
+
+        // 辅助函数：向DataView写入字符串
+        function writeString(view, offset, string) {
+            for (let i = 0; i < string.length; i++) {
+                view.setUint8(offset + i, string.charCodeAt(i));
+            }
+        }
+    </script>
+</body>
+</html>
